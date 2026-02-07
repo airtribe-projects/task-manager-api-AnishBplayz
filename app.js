@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -7,16 +8,22 @@ const port = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Initialize tasks array from task.json
+// Initialize tasks array from task.json (async to avoid blocking event loop)
 const taskFilePath = path.join(__dirname, 'task.json');
-const taskData = JSON.parse(fs.readFileSync(taskFilePath, 'utf8'));
-// Add createdAt and priority to existing tasks if missing
-let tasks = taskData.tasks.map((task) => ({
-	...task,
-	createdAt: task.createdAt || new Date().toISOString(),
-	priority: task.priority || 'medium',
-}));
-let nextId = Math.max(...tasks.map((task) => task.id), 0) + 1;
+let tasks = [];
+const loadTasksPromise = fs.promises.readFile(taskFilePath, 'utf8').then((data) => {
+	const taskData = JSON.parse(data);
+	// Add createdAt and priority to existing tasks if missing; normalize priority to lowercase
+	tasks = taskData.tasks.map((task) => ({
+		...task,
+		createdAt: task.createdAt || new Date().toISOString(),
+		priority: (task.priority || 'medium').toLowerCase(),
+	}));
+});
+
+const ensureTasksLoaded = (req, res, next) => {
+	loadTasksPromise.then(() => next()).catch(next);
+};
 
 // Validation helper function
 const validateTask = (task) => {
@@ -38,7 +45,8 @@ const validateTask = (task) => {
 	// Priority is optional, but if provided must be one of: low, medium, high
 	if (task.priority !== undefined) {
 		const validPriorities = ['low', 'medium', 'high'];
-		if (!validPriorities.includes(task.priority)) {
+		const priorityLower = String(task.priority).toLowerCase();
+		if (!validPriorities.includes(priorityLower)) {
 			return {
 				valid: false,
 				error: 'Priority must be one of: low, medium, high',
@@ -50,10 +58,17 @@ const validateTask = (task) => {
 
 // REST API v1 router - standard path: /api/v1
 const apiV1 = express.Router();
+apiV1.use(ensureTasksLoaded);
+
+// Helper to get sortable timestamp; returns Infinity for invalid dates to place them at end
+const getSortableTimestamp = (dateStr) => {
+	const timestamp = new Date(dateStr).getTime();
+	return Number.isNaN(timestamp) ? Infinity : timestamp;
+};
 
 // GET /api/v1/tasks - Retrieve all tasks with filtering and sorting
 apiV1.get('/tasks', (req, res) => {
-	let filteredTasks = [...tasks];
+	let filteredTasks = Array.from(tasks);
 
 	// Filter by completion status if provided
 	if (req.query.completed !== undefined) {
@@ -61,12 +76,12 @@ apiV1.get('/tasks', (req, res) => {
 		filteredTasks = filteredTasks.filter((task) => task.completed === completedFilter);
 	}
 
-	// Sort by creation date if requested
+	// Sort by creation date if requested (handles invalid dates gracefully)
 	if (req.query.sort === 'createdAt' || req.query.sort === '-createdAt') {
 		const isDescending = req.query.sort.startsWith('-');
 		filteredTasks.sort((a, b) => {
-			const dateA = new Date(a.createdAt).getTime();
-			const dateB = new Date(b.createdAt).getTime();
+			const dateA = getSortableTimestamp(a.createdAt);
+			const dateB = getSortableTimestamp(b.createdAt);
 			return isDescending ? dateB - dateA : dateA - dateB;
 		});
 	}
@@ -85,14 +100,15 @@ apiV1.get('/tasks/priority/:level', (req, res) => {
 		});
 	}
 
-	const filteredTasks = tasks.filter((task) => task.priority.toLowerCase() === priorityLevel);
+	// priorityLevel is already lowercase; tasks have normalized lowercase priority
+	const filteredTasks = tasks.filter((task) => task.priority === priorityLevel);
 	res.status(200).json(filteredTasks);
 });
 
-// GET /api/v1/tasks/:id - Retrieve a specific task by ID
+// GET /api/v1/tasks/:id - Retrieve a specific task by ID (supports numeric and UUID)
 apiV1.get('/tasks/:id', (req, res) => {
-	const id = parseInt(req.params.id, 10);
-	const task = tasks.find((t) => t.id === id);
+	const idParam = req.params.id;
+	const task = tasks.find((t) => String(t.id) === idParam);
 
 	if (!task) {
 		return res.status(404).json({ error: 'Task not found' });
@@ -110,11 +126,11 @@ apiV1.post('/tasks', (req, res) => {
 	}
 
 	const newTask = {
-		id: nextId++,
+		id: crypto.randomUUID(),
 		title: req.body.title,
 		description: req.body.description,
 		completed: req.body.completed,
-		priority: req.body.priority || 'medium',
+		priority: (req.body.priority || 'medium').toLowerCase(),
 		createdAt: new Date().toISOString(),
 	};
 
@@ -124,8 +140,8 @@ apiV1.post('/tasks', (req, res) => {
 
 // PUT /api/v1/tasks/:id - Update an existing task
 apiV1.put('/tasks/:id', (req, res) => {
-	const id = parseInt(req.params.id, 10);
-	const taskIndex = tasks.findIndex((t) => t.id === id);
+	const idParam = req.params.id;
+	const taskIndex = tasks.findIndex((t) => String(t.id) === idParam);
 
 	if (taskIndex === -1) {
 		return res.status(404).json({ error: 'Task not found' });
@@ -137,13 +153,13 @@ apiV1.put('/tasks/:id', (req, res) => {
 		return res.status(400).json({ error: validation.error });
 	}
 
-	// Preserve createdAt, update priority if provided or keep existing
+	// Preserve createdAt, update priority if provided or keep existing (normalize to lowercase)
 	tasks[taskIndex] = {
-		id: id,
+		id: tasks[taskIndex].id,
 		title: req.body.title,
 		description: req.body.description,
 		completed: req.body.completed,
-		priority: req.body.priority !== undefined ? req.body.priority : tasks[taskIndex].priority,
+		priority: (req.body.priority !== undefined ? req.body.priority : tasks[taskIndex].priority).toLowerCase(),
 		createdAt: tasks[taskIndex].createdAt, // Preserve original creation date
 	};
 
@@ -152,13 +168,14 @@ apiV1.put('/tasks/:id', (req, res) => {
 
 // DELETE /api/v1/tasks/:id - Delete a task
 apiV1.delete('/tasks/:id', (req, res) => {
-	const id = parseInt(req.params.id, 10);
-	const taskIndex = tasks.findIndex((t) => t.id === id);
+	const idParam = req.params.id;
+	const taskIndex = tasks.findIndex((t) => String(t.id) === idParam);
 
 	if (taskIndex === -1) {
 		return res.status(404).json({ error: 'Task not found' });
 	}
 
+	// Intentional mutation: splice removes from in-memory tasks array (desired for data integrity)
 	const deletedTask = tasks.splice(taskIndex, 1)[0];
 	res.status(200).json(deletedTask);
 });
@@ -168,17 +185,24 @@ app.use('/api/v1', apiV1);
 
 // Only start the server when run directly (e.g. node app.js), not when required by tests
 if (require.main === module) {
-	app.listen(port, (err) => {
-		if (err) {
-			if (err.code === 'EADDRINUSE') {
-				console.error(`Port ${port} is already in use. Stop the other process or run with: PORT=${port + 1} node app.js`);
-			} else {
-				console.error('Something bad happened', err);
-			}
-			return;
-		}
-		console.log(`Server is listening on http://localhost:${port}`);
-	});
+	loadTasksPromise
+		.then(() => {
+			app.listen(port, (err) => {
+				if (err) {
+					if (err.code === 'EADDRINUSE') {
+						console.error(`Port ${port} is already in use. Stop the other process or run with: PORT=${port + 1} node app.js`);
+					} else {
+						console.error('Something bad happened', err);
+					}
+					return;
+				}
+				console.log(`Server is listening on http://localhost:${port}`);
+			});
+		})
+		.catch((err) => {
+			console.error('Failed to load tasks:', err.message);
+			process.exit(1);
+		});
 }
 
 module.exports = app;
