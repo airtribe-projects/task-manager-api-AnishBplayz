@@ -171,9 +171,7 @@ if (require.main === module) {
 	app.listen(port, (err) => {
 		if (err) {
 			if (err.code === 'EADDRINUSE') {
-				console.error(
-					`Port ${port} is already in use. Stop the other process or run with: PORT=${port + 1} node app.js`,
-				);
+				console.error(`Port ${port} is already in use. Stop the other process or run with: PORT=${port + 1} node app.js`);
 			} else {
 				console.error('Something bad happened', err);
 			}
